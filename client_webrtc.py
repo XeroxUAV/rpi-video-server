@@ -18,6 +18,8 @@ class WebRTCClient:
         port: int,
         display_fps: int = 60,
         window_name: str = "Drone Camera (WebRTC)",
+        record: bool | str = False,
+        record_fps: float = 30.0,
     ):
         self.offer_url = f"http://{host}:{port}/offer"
         self.window_name = window_name
@@ -29,6 +31,26 @@ class WebRTCClient:
         self.recv_fps = 0.0
         self.loop = None
         self.pc = None
+
+        # Video recording configuration
+        self.record_enabled = bool(record)
+        if self.record_enabled:
+            if isinstance(record, str):
+                self.record_filename = record
+            else:
+                self.record_filename = f"recording_{time.strftime('%Y%m%d_%H%M%S')}.mp4"
+            self.record_fps = record_fps
+            self.record_queue = queue.Queue(maxsize=300)
+            self.record_thread = None
+            self.video_writer = None
+            self.recorded_frames_count = 0
+        else:
+            self.record_filename = None
+            self.record_fps = None
+            self.record_queue = None
+            self.record_thread = None
+            self.video_writer = None
+            self.recorded_frames_count = 0
 
     async def _run_webrtc(self):
         config = RTCConfiguration(
@@ -97,6 +119,13 @@ class WebRTCClient:
             # Convert av.VideoFrame to NumPy BGR image
             img = frame.to_ndarray(format="bgr24")
 
+            # Queue clean frame for recording if enabled
+            if self.record_enabled and self.record_queue is not None:
+                try:
+                    self.record_queue.put_nowait(img)
+                except queue.Full:
+                    pass
+
             # Store only the freshest frame (drop older unrendered frames)
             if self.frame_queue.full():
                 try:
@@ -115,6 +144,48 @@ class WebRTCClient:
                 recv_count = 0
                 fps_timer = time.time()
 
+    def _record_worker(self):
+        """Dedicated background thread to write recorded frames to disk without blocking WebRTC."""
+        while self.running.is_set() or (
+            self.record_queue is not None and not self.record_queue.empty()
+        ):
+            try:
+                frame = self.record_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            try:
+                if self.video_writer is None:
+                    h, w = frame.shape[:2]
+                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                    self.video_writer = cv2.VideoWriter(
+                        self.record_filename, fourcc, self.record_fps, (w, h)
+                    )
+                    if not self.video_writer.isOpened():
+                        print(
+                            f"[Record Error] Failed to open VideoWriter for '{self.record_filename}'"
+                        )
+                        self.video_writer = None
+                        continue
+                    print(
+                        f"[Record] Started recording to '{self.record_filename}' "
+                        f"({w}x{h} @ {self.record_fps:.1f} FPS)"
+                    )
+
+                self.video_writer.write(frame)
+                self.recorded_frames_count += 1
+            except Exception as e:
+                print(f"[Record Error] Failed to write frame: {e}")
+            finally:
+                self.record_queue.task_done()
+
+        if self.video_writer is not None:
+            self.video_writer.release()
+            self.video_writer = None
+            print(
+                f"[Record] Finished: saved {self.recorded_frames_count} frames to '{self.record_filename}'"
+            )
+
     def _webrtc_thread(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
@@ -132,8 +203,13 @@ class WebRTCClient:
         net_thread = threading.Thread(target=self._webrtc_thread, daemon=True)
         net_thread.start()
 
+        if self.record_enabled:
+            self.record_thread = threading.Thread(target=self._record_worker, daemon=True)
+            self.record_thread.start()
+
         cv2.namedWindow(self.window_name, cv2.WINDOW_AUTOSIZE)
-        print(f"[Client] Display ready ({self.display_fps} Hz). Press 'q' or click [X] to exit.")
+        rec_info = f" [Recording to {self.record_filename}]" if self.record_enabled else ""
+        print(f"[Client] Display ready ({self.display_fps} Hz).{rec_info} Press 'q' or click [X] to exit.")
 
         display_count = 0
         display_fps = 0.0
@@ -161,15 +237,22 @@ class WebRTCClient:
                         display_count = 0
                         fps_timer = time.time()
 
+                    hud_text = f"WebRTC Recv: {self.recv_fps:.1f} FPS | Render: {display_fps:.1f} FPS ({w}x{h})"
+                    if self.record_enabled:
+                        hud_text += f" | REC: {self.recorded_frames_count}"
+
                     cv2.putText(
                         display_image,
-                        f"WebRTC Recv: {self.recv_fps:.1f} FPS | Render: {display_fps:.1f} FPS ({w}x{h})",
+                        hud_text,
                         (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,
                         (0, 255, 0),
                         2,
                     )
+
+                    if self.record_enabled:
+                        cv2.circle(display_image, (w - 25, 25), 8, (0, 0, 255), -1)
 
                     cv2.imshow(self.window_name, display_image)
 
@@ -189,6 +272,9 @@ class WebRTCClient:
 
         finally:
             self.running.clear()
+            if self.record_enabled and self.record_thread is not None:
+                print("[Record] Finalizing video file...")
+                self.record_thread.join(timeout=5.0)
             cv2.destroyAllWindows()
             print("[Client] Exited cleanly.")
 
@@ -219,16 +305,32 @@ def parse_args():
         default="Drone Camera (WebRTC)",
         help="OpenCV window title",
     )
+    parser.add_argument(
+        "--record",
+        nargs="?",
+        const=True,
+        default=False,
+        help="Record incoming video stream to file (optionally specify filename, default: recording_<timestamp>.mp4)",
+    )
+    parser.add_argument(
+        "--record-fps",
+        type=float,
+        default=None,
+        help="Framerate for recorded video file (default: matches --display-fps or 30)",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    record_fps = args.record_fps if args.record_fps is not None else float(args.display_fps)
     client = WebRTCClient(
         host=args.host,
         port=args.port,
         display_fps=args.display_fps,
         window_name=args.window_name,
+        record=args.record,
+        record_fps=record_fps,
     )
     try:
         client.run()
@@ -238,3 +340,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
