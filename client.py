@@ -9,17 +9,33 @@ from websockets.sync.client import connect
 
 
 class StreamClient:
-    """Zero-latency video stream client displaying frames with OpenCV."""
+    """Zero-latency, jitter-free video stream client displaying frames with OpenCV.
 
-    def __init__(self, host: str, port: int, window_name: str = "Drone Camera"):
+    Emulates browser-grade rendering:
+    1. Background worker performs non-blocking I/O AND multi-threaded C++ JPEG decoding.
+    2. GUI thread is strictly dedicated to rendering pre-decoded frames at steady V-Sync pace.
+    3. Drops stale frames so rendering never lags behind the live camera stream.
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        display_fps: int = 60,
+        window_name: str = "Drone Camera",
+    ):
         self.uri = f"ws://{host}:{port}"
         self.window_name = window_name
-        self.frame_queue = queue.Queue(maxsize=1)
+        self.display_fps = display_fps
+        self.frame_interval = 1.0 / max(1, display_fps)
+
+        # Thread-safe queue containing only pre-decoded NumPy BGR frames
+        self.decoded_frame_queue = queue.Queue(maxsize=1)
         self.running = threading.Event()
         self.recv_fps = 0.0
 
-    def _network_worker(self):
-        """Worker thread: continuously receives frames and keeps only the freshest frame."""
+    def _network_and_decode_worker(self):
+        """Worker thread: Receives JPEG bytes and decodes them off the GUI thread."""
         while self.running.is_set():
             print(f"[Client] Connecting to {self.uri} ...")
             try:
@@ -35,14 +51,27 @@ class StreamClient:
                         if not isinstance(data, (bytes, bytearray)):
                             continue
 
-                        # Discard stale frame if main thread hasn't rendered it yet
-                        if self.frame_queue.full():
+                        # Fast JPEG boundary sanity check (prevents corrupt decoder stalls)
+                        if len(data) < 4 or not (
+                            data.startswith(b"\xff\xd8")
+                            and data.endswith(b"\xff\xd9")
+                        ):
+                            continue
+
+                        # Multi-threaded C++ JPEG decompression (releases Python GIL)
+                        np_arr = np.frombuffer(data, dtype=np.uint8)
+                        frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                        if frame is None:
+                            continue
+
+                        # Replace older unrendered frame with the newest frame
+                        if self.decoded_frame_queue.full():
                             try:
-                                self.frame_queue.get_nowait()
+                                self.decoded_frame_queue.get_nowait()
                             except queue.Empty:
                                 pass
                         try:
-                            self.frame_queue.put_nowait(data)
+                            self.decoded_frame_queue.put_nowait(frame)
                         except queue.Full:
                             pass
 
@@ -61,61 +90,64 @@ class StreamClient:
                     time.sleep(1.5)
 
     def run(self):
-        """Runs the OpenCV GUI loop on the main thread."""
+        """Runs the OpenCV GUI loop paced to monitor refresh rate (like requestAnimationFrame)."""
         self.running.set()
-        net_thread = threading.Thread(target=self._network_worker, daemon=True)
-        net_thread.start()
+        worker = threading.Thread(
+            target=self._network_and_decode_worker, daemon=True
+        )
+        worker.start()
 
         cv2.namedWindow(self.window_name, cv2.WINDOW_AUTOSIZE)
         print(
-            f"[Client] Display ready. Press 'q' or click the window [X] to exit."
+            f"[Client] Display active ({self.display_fps} Hz). Press 'q' or click [X] to exit."
         )
 
         display_count = 0
         display_fps = 0.0
         fps_timer = time.time()
+        last_frame = None
 
         try:
             while self.running.is_set():
+                tick_start = time.perf_counter()
+
+                # Get newest pre-decoded frame if available (non-blocking)
                 try:
-                    data = self.frame_queue.get(timeout=0.05)
+                    new_frame = self.decoded_frame_queue.get_nowait()
+                    last_frame = new_frame
+                    display_count += 1
                 except queue.Empty:
-                    # Keep OpenCV window responsive even when no frames arrive
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord("q"):
-                        break
-                    continue
+                    pass
 
-                np_arr = np.frombuffer(data, np.uint8)
-                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                if frame is None:
-                    continue
+                # If we have a frame, render it
+                if last_frame is not None:
+                    # Shallow copy for text overlay to avoid modifying original array
+                    display_image = last_frame.copy()
+                    h, w = display_image.shape[:2]
 
-                display_count += 1
-                elapsed = time.time() - fps_timer
-                if elapsed >= 1.0:
-                    display_fps = display_count / elapsed
-                    display_count = 0
-                    fps_timer = time.time()
+                    elapsed = time.time() - fps_timer
+                    if elapsed >= 1.0:
+                        display_fps = display_count / elapsed
+                        display_count = 0
+                        fps_timer = time.time()
 
-                h, w = frame.shape[:2]
-                cv2.putText(
-                    frame,
-                    f"Recv: {self.recv_fps:.1f} FPS | Disp: {display_fps:.1f} FPS ({w}x{h})",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
-                    2,
-                )
+                    cv2.putText(
+                        display_image,
+                        f"Recv: {self.recv_fps:.1f} FPS | Render: {display_fps:.1f} FPS ({w}x{h})",
+                        (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 0),
+                        2,
+                    )
 
-                cv2.imshow(self.window_name, frame)
+                    cv2.imshow(self.window_name, display_image)
 
+                # Process OS window manager events (keep GUI responsive)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
 
-                # Exit if the window was closed via the 'X' button
                 if (
                     cv2.getWindowProperty(
                         self.window_name, cv2.WND_PROP_VISIBLE
@@ -123,6 +155,13 @@ class StreamClient:
                     < 1
                 ):
                     break
+
+                # Frame Pacing: sleep just enough to match target refresh rate
+                time_taken = time.perf_counter() - tick_start
+                sleep_duration = self.frame_interval - time_taken
+                if sleep_duration > 0.001:
+                    time.sleep(sleep_duration)
+
         finally:
             self.running.clear()
             cv2.destroyAllWindows()
@@ -131,7 +170,7 @@ class StreamClient:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Drone Camera Stream Client (OpenCV)"
+        description="High-Speed Drone Video Client (OpenCV)"
     )
     parser.add_argument(
         "--host",
@@ -146,6 +185,12 @@ def parse_args():
         help="WebSocket port (default: 8765)",
     )
     parser.add_argument(
+        "--display-fps",
+        type=int,
+        default=60,
+        help="Target monitor refresh/display rate in Hz (default: 60)",
+    )
+    parser.add_argument(
         "--window-name",
         type=str,
         default="Drone Camera",
@@ -157,7 +202,10 @@ def parse_args():
 def main():
     args = parse_args()
     client = StreamClient(
-        host=args.host, port=args.port, window_name=args.window_name
+        host=args.host,
+        port=args.port,
+        display_fps=args.display_fps,
+        window_name=args.window_name,
     )
     try:
         client.run()
