@@ -217,4 +217,13 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Agnets files and dirs
 tasks/
+.agnets/
+graphify-out/
+AGENTS.md
+
+# Medias
+*.mp4
+*.mp3
+*.mkv
