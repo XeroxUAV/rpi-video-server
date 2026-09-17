@@ -227,3 +227,7 @@ AGENTS.md
 *.mp4
 *.mp3
 *.mkv
+
+# Models
+onnx-models/
+weights/
