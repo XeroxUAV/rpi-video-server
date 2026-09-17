@@ -44,22 +44,36 @@ class WebRTCClient:
         self.loop = None
         self.pc = None
         
-        self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-        self.input_name = self.session.get_inputs()[0].name
-        input_shape = self.session.get_inputs()[0].shape
-        self.net_h = input_shape[2] if isinstance(input_shape[2], int) else 480
-        self.net_w = input_shape[3] if isinstance(input_shape[3], int) else 640
-        self.conf_thresh = 0.25
-        self.nms_thresh = 0.45
-        self.class_names = {0: "Window-Iran-Open-V1"}
-        try:
-            meta = self.session.get_modelmeta().custom_metadata_map
-            if "names" in meta:
-                import ast
-                names_dict = ast.literal_eval(meta["names"])
-                self.class_names = {int(k): str(v) for k, v in names_dict.items()}
-        except Exception:
-            pass
+        self.session = None
+        self.model = None
+        self.is_pt = model_path.lower().endswith(".pt")
+        self.conf_thresh = conf_thresh
+        self.nms_thresh = nms_thresh
+
+        if self.is_pt:
+            from ultralytics import YOLO
+
+            self.model = YOLO(model_path)
+            self.class_names = getattr(self.model, "names", {0: "Window-Iran-Open-V1"})
+            self.input_name = None
+            self.net_w = 640
+            self.net_h = 480
+        else:
+            self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+            self.input_name = self.session.get_inputs()[0].name
+            input_shape = self.session.get_inputs()[0].shape
+            self.net_h = input_shape[2] if isinstance(input_shape[2], int) else 480
+            self.net_w = input_shape[3] if isinstance(input_shape[3], int) else 640
+            self.class_names = {0: "Window-Iran-Open-V1"}
+            try:
+                meta = self.session.get_modelmeta().custom_metadata_map
+                if "names" in meta:
+                    import ast
+
+                    names_dict = ast.literal_eval(meta["names"])
+                    self.class_names = {int(k): str(v) for k, v in names_dict.items()}
+            except Exception:
+                pass
         # Video recording configuration
         self.record_enabled = bool(record)
         if self.record_enabled:
@@ -283,57 +297,33 @@ class WebRTCClient:
                     if self.record_enabled:
                         cv2.circle(display_image, (w - 25, 25), 8, (0, 0, 255), -1)
 
-                    # Preprocessing for ONNX model (640x480, RGB, float32 0..1, NCHW)
-                    if (w, h) != (self.net_w, self.net_h):
-                        resized = cv2.resize(
-                            display_image, (self.net_w, self.net_h), interpolation=cv2.INTER_LINEAR
+                    if self.is_pt:
+                        # Ultralytics inference (.pt model)
+                        results = self.model(
+                            display_image,
+                            conf=self.conf_thresh,
+                            iou=self.nms_thresh,
+                            verbose=False,
                         )
-                        scale_x = w / self.net_w
-                        scale_y = h / self.net_h
-                    else:
-                        resized = display_image
-                        scale_x, scale_y = 1.0, 1.0
-
-                    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-                    blob = np.ascontiguousarray(
-                        (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None, ...]
-                    )
-
-                    outputs = self.session.run(None, {self.input_name: blob})
-                    output0 = outputs[0]  # Shape [1, 37, 6300]
-                    preds = output0[0].T  # Shape [6300, 37]
-
-                    boxes_xywh = preds[:, :4]
-                    scores = preds[:, 4]  # Class 0 confidence score
-
-                    mask = scores > self.conf_thresh
-                    cand_boxes = boxes_xywh[mask]
-                    cand_scores = scores[mask]
-
-                    if len(cand_boxes) > 0:
-                        boxes_for_nms = []
-                        for (cx, cy, bw_box, bh_box) in cand_boxes:
-                            x1 = int((cx - bw_box / 2.0) * scale_x)
-                            y1 = int((cy - bh_box / 2.0) * scale_y)
-                            bw = int(bw_box * scale_x)
-                            bh = int(bh_box * scale_y)
-                            boxes_for_nms.append([x1, y1, bw, bh])
-
-                        indices = cv2.dnn.NMSBoxes(
-                            boxes_for_nms, cand_scores.tolist(), self.conf_thresh, self.nms_thresh
-                        )
-                        if len(indices) > 0:
-                            for idx in indices.flatten():
-                                bx, by, bw, bh = boxes_for_nms[idx]
-                                score = float(cand_scores[idx])
-                                class_name = self.class_names.get(0, "Window-Iran-Open-V1")
+                        if results and len(results) > 0 and results[0].boxes is not None:
+                            boxes = results[0].boxes
+                            for box in boxes:
+                                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                                bx1, by1, bx2, by2 = xyxy
+                                score = float(box.conf[0].cpu().numpy())
+                                cls_id = int(box.cls[0].cpu().numpy())
+                                class_name = (
+                                    self.class_names[cls_id]
+                                    if cls_id in self.class_names
+                                    else f"Class {cls_id}"
+                                )
                                 label = f"{class_name} {score * 100:.1f}%"
 
                                 # Draw bounding box
                                 cv2.rectangle(
                                     display_image,
-                                    (max(0, bx), max(0, by)),
-                                    (min(w - 1, bx + bw), min(h - 1, by + bh)),
+                                    (max(0, bx1), max(0, by1)),
+                                    (min(w - 1, bx2), min(h - 1, by2)),
                                     (0, 255, 0),
                                     2,
                                 )
@@ -344,20 +334,96 @@ class WebRTCClient:
                                 )
                                 cv2.rectangle(
                                     display_image,
-                                    (max(0, bx), max(0, by - th - 6)),
-                                    (min(w - 1, bx + tw + 6), max(0, by)),
+                                    (max(0, bx1), max(0, by1 - th - 6)),
+                                    (min(w - 1, bx1 + tw + 6), max(0, by1)),
                                     (0, 255, 0),
                                     -1,
                                 )
                                 cv2.putText(
                                     display_image,
                                     label,
-                                    (max(0, bx) + 3, max(th, by - 4)),
+                                    (max(0, bx1) + 3, max(th, by1 - 4)),
                                     cv2.FONT_HERSHEY_SIMPLEX,
                                     0.5,
                                     (0, 0, 0),
                                     1,
                                 )
+                    else:
+                        # Preprocessing for ONNX model (640x480, RGB, float32 0..1, NCHW)
+                        if (w, h) != (self.net_w, self.net_h):
+                            resized = cv2.resize(
+                                display_image, (self.net_w, self.net_h), interpolation=cv2.INTER_LINEAR
+                            )
+                            scale_x = w / self.net_w
+                            scale_y = h / self.net_h
+                        else:
+                            resized = display_image
+                            scale_x, scale_y = 1.0, 1.0
+
+                        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+                        blob = np.ascontiguousarray(
+                            (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None, ...]
+                        )
+
+                        outputs = self.session.run(None, {self.input_name: blob})
+                        output0 = outputs[0]  # Shape [1, 37, 6300]
+                        preds = output0[0].T  # Shape [6300, 37]
+
+                        boxes_xywh = preds[:, :4]
+                        scores = preds[:, 4]  # Class 0 confidence score
+
+                        mask = scores > self.conf_thresh
+                        cand_boxes = boxes_xywh[mask]
+                        cand_scores = scores[mask]
+
+                        if len(cand_boxes) > 0:
+                            boxes_for_nms = []
+                            for (cx, cy, bw_box, bh_box) in cand_boxes:
+                                x1 = int((cx - bw_box / 2.0) * scale_x)
+                                y1 = int((cy - bh_box / 2.0) * scale_y)
+                                bw = int(bw_box * scale_x)
+                                bh = int(bh_box * scale_y)
+                                boxes_for_nms.append([x1, y1, bw, bh])
+
+                            indices = cv2.dnn.NMSBoxes(
+                                boxes_for_nms, cand_scores.tolist(), self.conf_thresh, self.nms_thresh
+                            )
+                            if len(indices) > 0:
+                                for idx in indices.flatten():
+                                    bx, by, bw, bh = boxes_for_nms[idx]
+                                    score = float(cand_scores[idx])
+                                    class_name = self.class_names.get(0, "Window-Iran-Open-V1")
+                                    label = f"{class_name} {score * 100:.1f}%"
+
+                                    # Draw bounding box
+                                    cv2.rectangle(
+                                        display_image,
+                                        (max(0, bx), max(0, by)),
+                                        (min(w - 1, bx + bw), min(h - 1, by + bh)),
+                                        (0, 255, 0),
+                                        2,
+                                    )
+
+                                    # Draw label badge
+                                    (tw, th), baseline = cv2.getTextSize(
+                                        label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+                                    )
+                                    cv2.rectangle(
+                                        display_image,
+                                        (max(0, bx), max(0, by - th - 6)),
+                                        (min(w - 1, bx + tw + 6), max(0, by)),
+                                        (0, 255, 0),
+                                        -1,
+                                    )
+                                    cv2.putText(
+                                        display_image,
+                                        label,
+                                        (max(0, bx) + 3, max(th, by - 4)),
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.5,
+                                        (0, 0, 0),
+                                        1,
+                                    )
 
                     cv2.imshow(self.window_name, display_image)
 

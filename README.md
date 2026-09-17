@@ -142,6 +142,49 @@ python client_webrtc.py --host <PI_IP_ADDRESS>
 
 ---
 
+## WebRTC AI Object Detection Client (`inference.py`)
+
+[`inference.py`](inference.py) connects to the WebRTC server, consumes the live video stream, and runs real-time YOLOv8 ONNX object detection using [`onnx-models/best_1.onnx`](onnx-models/best_1.onnx) without slowing down WebRTC reception.
+
+### Architecture & Non-Blocking Design
+
+- **Thread 1 (WebRTC Network):** Receives RTP video frames asynchronously. Frames are pushed via non-blocking single-item queues. Zero model computation occurs in this thread, ensuring **zero packet drops or network jitter**.
+- **Thread 2 (AI Inference Worker):** A dedicated background thread executing `onnxruntime` inference. Drops older frames when the detector is busy so the model **always evaluates the freshest frame with zero latency accumulation**.
+- **Thread 3 (OpenCV GUI):** Renders the live video paced to monitor V-Sync (60 Hz), drawing bounding boxes, class names (`Window-Iran-Open-V1`), confidence percentages, and a multi-metric HUD.
+
+### Quick Start
+
+```bash
+python inference.py --host <PI_IP_ADDRESS>
+```
+
+### CLI Arguments
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--host` | `str` | `172.21.35.248` | IP address of the Raspberry Pi running `server_webrtc.py`. |
+| `--port` | `int` | `8080` | WebRTC signaling port of the server. |
+| `--model` | `str` | `onnx-models/best_1.onnx` | Path to the ONNX detection model. |
+| `--conf-thresh` | `float` | `0.25` | Minimum confidence score threshold (0.0–1.0) for detections. |
+| `--nms-thresh` | `float` | `0.45` | Non-maximum suppression IoU threshold. |
+| `--device` | `str` | `auto` | Execution device: `auto`, `cuda`, or `cpu`. |
+| `--display-fps` | `int` | `60` | Target GUI display refresh rate in Hz. |
+| `--record` | `str` / flag | `False` | Optionally record stream to MP4 (`--record` or `--record file.mp4`). |
+
+### Examples
+
+- **Run detection on CPU/GPU:**
+  ```bash
+  python inference.py --host 192.168.1.50 --device auto
+  ```
+
+- **Adjust confidence threshold and record detections:**
+  ```bash
+  python inference.py --host 192.168.1.50 --conf-thresh 0.35 --record detections.mp4
+  ```
+
+---
+
 ## Web Browser Viewer (`web/webrtc.html`)
 
 For a zero-installation experience on phones, tablets, or computers:
