@@ -6,7 +6,7 @@ import keyboard
 # CONFIGURATION
 # ============================================================
 
-CONNECTION_STRING = "udp:0.0.0.0:14552"
+CONNECTION_STRING = "udp:172.21.35.192:14552"
 
 COMMAND_RATE = 20
 COMMAND_PERIOD = 1.0 / COMMAND_RATE
