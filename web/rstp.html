@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Drone Live RTSP Stream & Web Viewer</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0a0e14;
+      color: #e6edf3;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    header {
+      padding: 10px 20px;
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      z-index: 10;
+    }
+    .status-group {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 12px;
+      border-radius: 14px;
+      font-size: 13px;
+      font-weight: 500;
+      background: #21262d;
+      border: 1px solid #30363d;
+    }
+    .badge strong { color: #58a6ff; }
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #f85149;
+    }
+    .dot.connected { background: #3fb950; box-shadow: 0 0 8px #3fb950; }
+    .dot.connecting { background: #d29922; }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    button {
+      background: #238636;
+      color: #fff;
+      border: none;
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover { background: #2ea043; }
+    button.disconnect { background: #da3633; }
+    button.disconnect:hover { background: #f85149; }
+    button.copy-btn {
+      background: #1f6feb;
+      font-size: 12px;
+      padding: 4px 10px;
+    }
+    button.copy-btn:hover { background: #388bfd; }
+
+    main {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    #video-container {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+      position: relative;
+    }
+    canvas {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+    }
+    .hud {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      background: rgba(13, 17, 23, 0.85);
+      backdrop-filter: blur(6px);
+      padding: 10px 16px;
+      border-radius: 8px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 13px;
+      color: #39d353;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      pointer-events: none;
+      line-height: 1.5;
+    }
+    .hud-sub {
+      color: #8b949e;
+      font-size: 12px;
+    }
+
+    #sidebar {
+      width: 360px;
+      background: #161b22;
+      border-left: 1px solid #30363d;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      overflow-y: auto;
+    }
+    .card {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .card-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #8b949e;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .url-box {
+      display: flex;
+      align-items: center;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 6px 10px;
+      gap: 8px;
+    }
+    .url-text {
+      flex: 1;
+      font-family: monospace;
+      font-size: 13px;
+      color: #58a6ff;
+      word-break: break-all;
+    }
+    .tabs {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .tab {
+      background: #21262d;
+      border: 1px solid #30363d;
+      color: #c9d1d9;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 4px 8px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .tab.active {
+      background: #388bfd;
+      color: #fff;
+      border-color: #388bfd;
+    }
+    pre {
+      background: #010409;
+      border: 1px solid #21262d;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 11px;
+      color: #7ee787;
+      overflow-x: auto;
+      position: relative;
+    }
+    .pre-copy {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      padding: 2px 6px;
+      font-size: 10px;
+      background: #21262d;
+      color: #8b949e;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .pre-copy:hover { color: #fff; background: #30363d; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="status-group">
+      <div class="badge">
+        <span id="status-dot" class="dot"></span>
+        <span id="status-text">Disconnected</span>
+      </div>
+      <div class="badge">Protocol: <strong>RTSP (H.264 / RTP)</strong></div>
+      <div class="badge">FPS: <strong id="fps-val">0.0</strong></div>
+      <div class="badge">Res: <strong id="res-val">-</strong></div>
+      <div class="badge">RTSP Clients: <strong id="rtsp-clients-val">0</strong></div>
+    </div>
+    <div class="controls">
+      <button id="btn-toggle">Connect Web View</button>
+      <button id="btn-fullscreen" style="background:#30363d;">Fullscreen</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="video-container">
+      <canvas id="viewport"></canvas>
+      <div class="hud" id="hud-overlay">
+        <div>Status: <span id="hud-status" style="color:#e6edf3;">Connecting...</span></div>
+        <div class="hud-sub" id="hud-details">Listening for RTSP stream broadcast</div>
+      </div>
+    </div>
+
+    <aside id="sidebar">
+      <div class="card">
+        <div class="card-title">
+          <span>RTSP Stream URL</span>
+          <button class="copy-btn" id="btn-copy-url">Copy</button>
+        </div>
+        <div class="url-box">
+          <span class="url-text" id="rtsp-url-display">rtsp://localhost:8554/live</span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          <span>External Players</span>
+        </div>
+        <div class="tabs">
+          <div class="tab active" data-tab="vlc">VLC</div>
+          <div class="tab" data-tab="ffplay">FFplay</div>
+          <div class="tab" data-tab="python">OpenCV</div>
+          <div class="tab" data-tab="gstreamer">GStreamer</div>
+        </div>
+
+        <div id="snippet-vlc">
+          <pre><code id="code-vlc">vlc --network-caching=100 rtsp://localhost:8554/live</code><button class="pre-copy" onclick="copySnippet('code-vlc')">Copy</button></pre>
+        </div>
+
+        <div id="snippet-ffplay" style="display:none;">
+          <pre><code id="code-ffplay">ffplay -fflags nobuffer -flags low_delay -rtsp_transport udp rtsp://localhost:8554/live</code><button class="pre-copy" onclick="copySnippet('code-ffplay')">Copy</button></pre>
+        </div>
+
+        <div id="snippet-python" style="display:none;">
+          <pre><code id="code-python">import cv2
+cap = cv2.VideoCapture("rtsp://localhost:8554/live")
+while cap.isOpened():
+    ret, frame = cap.read()
+    if ret:
+        cv2.imshow("RTSP", frame)
+    if cv2.waitKey(1) == ord('q'):
+        break</code><button class="pre-copy" onclick="copySnippet('code-python')">Copy</button></pre>
+        </div>
+
+        <div id="snippet-gstreamer" style="display:none;">
+          <pre><code id="code-gstreamer">gst-launch-1.0 rtspsrc location=rtsp://localhost:8554/live latency=50 ! decodebin ! autovideosink</code><button class="pre-copy" onclick="copySnippet('code-gstreamer')">Copy</button></pre>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Stream Telemetry</div>
+        <div style="font-size: 12px; color: #8b949e; line-height: 1.6;">
+          <div>Encoding: <span style="color:#e6edf3;">H.264 Baseline (PyAV)</span></div>
+          <div>Packetization: <span style="color:#e6edf3;">RFC 6184 (Single + FU-A)</span></div>
+          <div>RTP Clock: <span style="color:#e6edf3;">90,000 Hz</span></div>
+          <div>Transport: <span style="color:#e6edf3;">UDP Unicast / TCP Interleaved</span></div>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <script>
+    const canvas = document.getElementById("viewport");
+    const ctx = canvas.getContext("2d");
+    const statusDot = document.getElementById("status-dot");
+    const statusText = document.getElementById("status-text");
+    const fpsVal = document.getElementById("fps-val");
+    const resVal = document.getElementById("res-val");
+    const rtspClientsVal = document.getElementById("rtsp-clients-val");
+    const hudStatus = document.getElementById("hud-status");
+    const hudDetails = document.getElementById("hud-details");
+    const btnToggle = document.getElementById("btn-toggle");
+    const btnFullscreen = document.getElementById("btn-fullscreen");
+    const btnCopyUrl = document.getElementById("btn-copy-url");
+    const rtspUrlDisplay = document.getElementById("rtsp-url-display");
+
+    let ws = null;
+    let frameCount = 0;
+    let fpsTimer = performance.now();
+    let currentFps = 0.0;
+    let pendingBitmap = null;
+    let statsTimer = null;
+
+    // Detect server host and ports
+    const host = window.location.hostname || "localhost";
+    const rtspPort = 8554;
+    const rtspUrl = `rtsp://${host}:${rtspPort}/live`;
+
+    rtspUrlDisplay.textContent = rtspUrl;
+    document.getElementById("code-vlc").textContent = `vlc --network-caching=100 ${rtspUrl}`;
+    document.getElementById("code-ffplay").textContent = `ffplay -fflags nobuffer -flags low_delay -rtsp_transport udp ${rtspUrl}`;
+    document.getElementById("code-python").textContent = `import cv2\ncap = cv2.VideoCapture("${rtspUrl}")\nwhile cap.isOpened():\n    ret, frame = cap.read()\n    if ret:\n        cv2.imshow("RTSP", frame)\n    if cv2.waitKey(1) == ord('q'):\n        break`;
+    document.getElementById("code-gstreamer").textContent = `gst-launch-1.0 rtspsrc location=${rtspUrl} latency=50 ! decodebin ! autovideosink`;
+
+    function renderLoop() {
+      if (pendingBitmap) {
+        if (canvas.width !== pendingBitmap.width || canvas.height !== pendingBitmap.height) {
+          canvas.width = pendingBitmap.width;
+          canvas.height = pendingBitmap.height;
+          resVal.textContent = `${pendingBitmap.width}x${pendingBitmap.height}`;
+        }
+        ctx.drawImage(pendingBitmap, 0, 0);
+        pendingBitmap.close();
+        pendingBitmap = null;
+      }
+      requestAnimationFrame(renderLoop);
+    }
+    requestAnimationFrame(renderLoop);
+
+    function connect() {
+      const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
+
+      statusText.textContent = "Connecting...";
+      statusDot.className = "dot connecting";
+      hudStatus.textContent = "Connecting to WebSocket...";
+      btnToggle.textContent = "Connecting...";
+
+      try {
+        ws = new WebSocket(wsUrl);
+        ws.binaryType = "blob";
+
+        ws.onopen = () => {
+          statusText.textContent = "Live";
+          statusDot.className = "dot connected";
+          btnToggle.textContent = "Disconnect";
+          btnToggle.className = "disconnect";
+          hudStatus.textContent = "Live Stream Active";
+          startStatsPolling();
+        };
+
+        ws.onmessage = async (event) => {
+          frameCount++;
+          const now = performance.now();
+          if (now - fpsTimer >= 1000) {
+            currentFps = (frameCount * 1000) / (now - fpsTimer);
+            frameCount = 0;
+            fpsTimer = now;
+            fpsVal.textContent = currentFps.toFixed(1);
+            hudDetails.textContent = `FPS: ${currentFps.toFixed(1)} | Res: ${canvas.width}x${canvas.height}`;
+          }
+
+          try {
+            const bmp = await createImageBitmap(event.data);
+            if (pendingBitmap) pendingBitmap.close();
+            pendingBitmap = bmp;
+          } catch (err) {
+            // Drop invalid frame
+          }
+        };
+
+        ws.onclose = () => {
+          statusText.textContent = "Disconnected";
+          statusDot.className = "dot";
+          btnToggle.textContent = "Connect Web View";
+          btnToggle.className = "";
+          hudStatus.textContent = "Disconnected";
+          if (statsTimer) clearInterval(statsTimer);
+          ws = null;
+        };
+
+        ws.onerror = () => {
+          if (ws) ws.close();
+        };
+      } catch (e) {
+        statusText.textContent = "Error";
+      }
+    }
+
+    function disconnect() {
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+    }
+
+    function startStatsPolling() {
+      if (statsTimer) clearInterval(statsTimer);
+      statsTimer = setInterval(async () => {
+        try {
+          const res = await fetch("/stats");
+          if (res.ok) {
+            const data = await res.json();
+            if (data.rtsp_clients !== undefined) {
+              rtspClientsVal.textContent = data.rtsp_clients;
+            }
+          }
+        } catch (e) {}
+      }, 2000);
+    }
+
+    btnToggle.addEventListener("click", () => {
+      if (ws) disconnect();
+      else connect();
+    });
+
+    btnFullscreen.addEventListener("click", () => {
+      const container = document.getElementById("video-container");
+      if (!document.fullscreenElement) {
+        container.requestFullscreen();
+      } else {
+        document.exitFullscreen();
+      }
+    });
+
+    btnCopyUrl.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(rtspUrl);
+        btnCopyUrl.textContent = "Copied!";
+        setTimeout(() => (btnCopyUrl.textContent = "Copy"), 1500);
+      } catch (err) {
+        prompt("Copy RTSP URL:", rtspUrl);
+      }
+    });
+
+    window.copySnippet = async (elemId) => {
+      const text = document.getElementById(elemId).textContent;
+      try {
+        await navigator.clipboard.writeText(text);
+        alert("Command copied to clipboard!");
+      } catch (e) {
+        prompt("Copy command:", text);
+      }
+    };
+
+    // Tab switching
+    document.querySelectorAll(".tab").forEach((tab) => {
+      tab.addEventListener("click", () => {
+        document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
+        tab.classList.add("active");
+
+        const target = tab.getAttribute("data-tab");
+        ["vlc", "ffplay", "python", "gstreamer"].forEach((id) => {
+          const elem = document.getElementById(`snippet-${id}`);
+          if (elem) elem.style.display = id === target ? "block" : "none";
+        });
+      });
+    });
+
+    // Auto-connect on load
+    window.addEventListener("load", () => {
+      connect();
+    });
+  </script>
+</body>
+</html>

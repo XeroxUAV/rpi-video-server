@@ -162,6 +162,85 @@ For a zero-installation experience on phones, tablets, or computers:
 
 ---
 
+## Running the RTSP Server & Web Viewer (`server_rstp.py`)
+
+[`server_rstp.py`](server_rstp.py) broadcasts standard RTSP 1.0 (RFC 2326 / RFC 7826) streams over UDP and TCP (interleaved) using in-memory H.264 PyAV encoding. It concurrently serves an interactive HTML5 companion web viewer ([`web/rstp.html`](web/rstp.html)) on HTTP port `8080`.
+
+### Quick Start
+
+```bash
+python server_rstp.py
+```
+
+By default, the RTSP stream is available at `rtsp://0.0.0.0:8554/live` and the companion web viewer at `http://0.0.0.0:8080/`.
+
+### CLI Arguments
+
+| Argument | Type | Default | Choices | Description |
+|---|---|---|---|---|
+| `--host` | `str` | `0.0.0.0` | Any valid IP | Host IP address to bind both RTSP and HTTP servers to. |
+| `--rtsp-port` | `int` | `8554` | Any valid port | RTSP server port for streaming (RFC 2326). |
+| `--http-port` | `int` | `8080` | Any valid port | HTTP web viewer and WebSocket stream port. |
+| `--fps` | `int` | `30` | `30`, `90` | Target camera capture and streaming framerate. |
+| `--resolution` | `int` | `480` | `480`, `720`, `1080` | Vertical resolution: `480` (640x480), `720` (1280x720), or `1080` (1920x1080). |
+| `--quality` | `int` | `60` | `1-100` | JPEG quality for in-browser web preview. |
+
+### Examples
+
+- **Standard HD RTSP Stream (720p @ 30 FPS):**
+  ```bash
+  python server_rstp.py --fps 30 --resolution 720
+  ```
+
+- **High-speed 90 FPS Stream on custom ports:**
+  ```bash
+  python server_rstp.py --fps 90 --resolution 480 --rtsp-port 8554 --http-port 8080
+  ```
+
+### Connecting External RTSP Players
+
+The stream can be played directly by any standard RTSP client using the URL `rtsp://<PI_IP_ADDRESS>:8554/live`:
+
+- **VLC Media Player (Low Caching):**
+  ```bash
+  vlc --network-caching=100 rtsp://<PI_IP>:8554/live
+  ```
+
+- **FFplay (Ultra Low Latency):**
+  ```bash
+  ffplay -fflags nobuffer -flags low_delay -rtsp_transport udp rtsp://<PI_IP>:8554/live
+  ```
+
+- **Python OpenCV:**
+  ```python
+  import cv2
+
+  cap = cv2.VideoCapture("rtsp://<PI_IP>:8554/live")
+  while cap.isOpened():
+      ret, frame = cap.read()
+      if ret:
+          cv2.imshow("Drone RTSP", frame)
+      if cv2.waitKey(1) == ord("q"):
+          break
+  cap.release()
+  cv2.destroyAllWindows()
+  ```
+
+- **GStreamer / OBS:**
+  ```bash
+  gst-launch-1.0 rtspsrc location=rtsp://<PI_IP>:8554/live latency=50 ! decodebin ! autovideosink
+  ```
+
+### HTML5 RTSP Web Viewer (`web/rstp.html`)
+
+Access `http://<PI_IP>:8080/` in any browser to:
+- Watch the live video stream with zero external player installation.
+- Monitor real-time FPS, stream resolution, and active RTSP client counts.
+- Copy the full RTSP URL with 1-click.
+- Copy pre-configured commands for VLC, FFplay, OpenCV, and GStreamer.
+
+---
+
 ## Architecture Summary
 
 ```
@@ -173,25 +252,23 @@ For a zero-installation experience on phones, tablets, or computers:
 │  • Atomic frame buffer (zero queuing delay)                  │
 │                               │                              │
 │                               ▼                              │
-│  [CameraStreamTrack]                                         │
+│  [CameraStreamTrack] / [H264Encoder & RTPPacketizer]         │
 │  • Pulls latest frame on demand                              │
-│  • av.VideoFrame conversion + 90kHz PTS timestamps           │
-│  • Encodes to H.264 / VP8 via aiortc                         │
+│  • WebRTC RTP / RTSP RFC 6184 H.264 packetization            │
+│  • Encodes to H.264 via aiortc / PyAV                        │
 │                               │                              │
 │                               ▼                              │
-│  [aiohttp Server]                                            │
-│  • POST /offer : Single-roundtrip SDP exchange               │
-│  • GET  /      : Serves web/webrtc.html static viewer        │
+│  [Broadcasting Engines]                                      │
+│  • WebRTC : server_webrtc.py (Port 8080)                     │
+│  • RTSP   : server_rstp.py   (Port 8554 + HTTP Port 8080)    │
 └──────────────────────────────┬───────────────────────────────┘
-                               │ WebRTC (UDP)
+                               │ WebRTC / RTSP (UDP/TCP)
              ┌─────────────────┴─────────────────┐
              ▼                                   ▼
 ┌───────────────────────────────┐ ┌───────────────────────────────┐
-│     Desktop OpenCV Client     │ │      HTML5 Web Viewer         │
-│      (client_webrtc.py)       │ │      (web/webrtc.html)        │
-│ • SDP handshake via HTTP      │ │ • Hardware-accelerated <video>│
-│ • aiortc track consumer       │ │ • Real-time WebRTC stats HUD  │
-│ • OpenCV V-Sync display       │ │ • Sub-50ms playback           │
-│ • Optional MP4 file recording │ │ • Zero install required       │
+│     Desktop / Media Players   │ │      HTML5 Web Viewers        │
+│ • client_webrtc.py (OpenCV)   │ │ • web/webrtc.html             │
+│ • VLC / FFplay / OBS (RTSP)   │ │ • web/rstp.html               │
+│ • Real-time display & record  │ │ • Real-time stats HUD         │
 └───────────────────────────────┘ └───────────────────────────────┘
 ```
